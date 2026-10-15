@@ -1,0 +1,14 @@
+schema_version = "1.0.0"
+
+id = "blender_mcp_bridge"
+version = "0.1.0"
+name = "MCP Bridge"
+tagline = "Local socket bridge so the blender-mcp server can drive Blender"
+maintainer = "David Rodríguez"
+type = "add-on"
+blender_version_min = "4.2.0"
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+network = "Listens on 127.0.0.1 only, for the local blender-mcp server"
+files = "Runs Python sent by the local blender-mcp server, which can read and write files"

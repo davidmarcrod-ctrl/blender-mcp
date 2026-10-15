@@ -215,7 +215,10 @@ for (var i = 0; i < picked.length; i++) {
         var ap = L.transform.anchorPoint.valueAtTime(0, false);
         m.anchor = [ap[0], ap[1], ap.length > 2 ? ap[2] : 0];
         var src = L.source;
-        if (src instanceof FootageItem && src.mainSource instanceof FileSource && src.file) {
+        if (src instanceof FootageItem && src.mainSource instanceof SolidSource) {
+            var sc = src.mainSource.color;
+            m.solid_color = [sc[0], sc[1], sc[2]];
+        } else if (src instanceof FootageItem && src.mainSource instanceof FileSource && src.file) {
             var path = src.file.fsName;
             var isMovie = /\\.(mov|mp4|m4v|avi|mxf|webm|mkv)$/i.test(path);
             m.source = { path: path, is_movie: isMovie, is_sequence: !isMovie && !src.mainSource.isStill,

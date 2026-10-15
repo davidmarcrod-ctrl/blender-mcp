@@ -265,6 +265,8 @@ def apply_from_ae(data, ppm, collection_name, set_scene, frame_offset):
                 o.data = mesh
             if layer.get("source"):
                 _assign_footage_material(o, layer["source"], frame_offset)
+            elif layer.get("solid_color"):
+                _assign_solid_material(o, layer["solid_color"])
         else:
             if o is None or o.type != "EMPTY":
                 o = bpy.data.objects.new(name, None)
@@ -320,6 +322,28 @@ def _ae_plane_mesh(name, layer, ppm):
         loop.uv = co
     mesh.update()
     return mesh
+
+
+def _srgb_to_linear(c):
+    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def _assign_solid_material(o, color):
+    """Flat unlit material matching an AE solid (AE stores display sRGB; Blender wants linear)."""
+    mat = bpy.data.materials.get(o.name) or bpy.data.materials.new(o.name)
+    mat.use_nodes = True
+    nt = mat.node_tree
+    nt.nodes.clear()
+    out = nt.nodes.new("ShaderNodeOutputMaterial")
+    emit = nt.nodes.new("ShaderNodeEmission")
+    emit.inputs["Color"].default_value = [_srgb_to_linear(c) for c in color[:3]] + [1.0]
+    nt.links.new(emit.outputs[0], out.inputs["Surface"])
+    emit.location, out.location = (-200, 0), (0, 0)
+    mat.diffuse_color = list(emit.inputs["Color"].default_value)
+    if not o.material_slots:
+        o.data.materials.append(mat)
+    else:
+        o.material_slots[0].material = mat
 
 
 def _assign_footage_material(o, source, frame_offset):

@@ -7,7 +7,7 @@ import re
 import tempfile
 
 import bpy
-from mathutils import Matrix, Vector, Euler
+from mathutils import Matrix, Vector, Euler, Quaternion
 
 
 # --- Lookup -----------------------------------------------------------------------------
@@ -468,7 +468,7 @@ def setup_separate_outputs(sc, directory, prefix, depth, codec):
     fo.file_output_items.clear()
     written = []
     for sock in rl.outputs:
-        if not sock.enabled or sock.name == "Alpha" or sock.name.startswith("Crypto"):
+        if (not sock.enabled or sock.name == "Alpha" or sock.name.startswith(("Crypto", "Noisy", "Denoising"))):
             continue
         tag = PASS_FILE_TAGS.get(sock.name, re.sub(r"\W+", "", sock.name))
         stype = {"VALUE": "FLOAT", "VECTOR": "VECTOR"}.get(sock.type, "RGBA")

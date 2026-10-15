@@ -266,7 +266,7 @@ return { comp: comp.name, width: comp.width, height: comp.height, fps: comp.fram
                     if (samples.every((s) => JSON.stringify(s) === first)) samples = [samples[0]];
                     return { ...meta, samples, step: args.step };
                 });
-                const created = await runPython(
+                const created = await runPython<{ objects: unknown[]; warnings: unknown[] }>(
                     `
 data = args["data"]
 for l in data["layers"]:
@@ -274,7 +274,8 @@ for l in data["layers"]:
     if src and src.get("is_sequence"):
         m = re.search(r"(\\d+)(?=\\.[^.]+$)", os.path.basename(src["path"]))
         src["first_number"] = int(m.group(1)) if m else 1
-return apply_from_ae(data, args["ppm"], args["collection"], args["setScene"], args["frameStart"])
+return {"objects": apply_from_ae(data, args["ppm"], args["collection"], args["setScene"], args["frameStart"]),
+        "warnings": [w for w in [hdr_warning()] if w]}
 `,
                     {
                         data: { width: ae.width, height: ae.height, fps: ae.fps, num_frames: ae.num_frames, layers },
@@ -285,7 +286,7 @@ return apply_from_ae(data, args["ppm"], args["collection"], args["setScene"], ar
                     },
                     { undo: "MCP: import from AE", timeoutMs: 600_000 }
                 );
-                return { comp: ae.comp, size: [ae.width, ae.height], fps: ae.fps, frames: ae.num_frames, created };
+                return { comp: ae.comp, size: [ae.width, ae.height], fps: ae.fps, frames: ae.num_frames, created: created.objects, warnings: created.warnings };
             })
     );
 
@@ -294,7 +295,7 @@ return apply_from_ae(data, args["ppm"], args["collection"], args["setScene"], ar
         {
             title: "Import Blender render into After Effects",
             description:
-                "Imports rendered image sequences into After Effects and stacks them in a comp. Give a jobId from render_animation, or a directory. With separate passes, the beauty is the visible base layer and each pass is added above it, disabled, with a suggested blend mode (AO/shadow multiply, emission/glossy/env add) so the compositor switches on what they need. Multilayer EXR comes in as one layer (use AE's Cryptomatte effect or EXtractoR on it). Layers go to the bottom of an existing comp, below any camera/nulls from export_to_ae. Footage is interpreted at the Blender fps.",
+                "Imports rendered image sequences into After Effects and stacks them in a comp. Give a jobId from render_animation, or a directory. With separate passes, the beauty is the visible base layer and each pass is added above it, disabled, with a suggested blend mode (AO/shadow multiply, emission/glossy/env add) so the compositor switches on what they need. Multilayer EXR comes in as one layer (use AE's Cryptomatte effect or EXtractoR on it). If the comp already holds an opaque footage layer (the plate, e.g. the filmed shot), the beauty goes right above it and the shadow catcher pass (Cycles shadow_catcher) right below the beauty, switched on in Multiply, so the CG casts its shadows onto the plate; the other passes sit above the beauty. Without a plate, the layers go to the bottom of the comp, below any camera/nulls from export_to_ae. To land in the plate's comp, pass its name as compName. Footage is interpreted at the Blender fps.",
             inputSchema: z.object({
                 jobId: z.string().optional(),
                 directory: z.string().optional().describe("Absolute directory with the sequences (used if no jobId)."),
@@ -359,7 +360,21 @@ for (var i = 1; i <= app.project.numItems; i++) {
 }
 if (!folder) folder = app.project.items.addFolder("Blender Renders");
 var items = [];
+function findImported(path) {
+    for (var k = 1; k <= folder.numItems; k++) {
+        var f = folder.item(k);
+        if (f instanceof FootageItem && f.file && f.file.fsName === path) return f;
+    }
+    return null;
+}
 for (var i = 0; i < seqs.length; i++) {
+    var again = findImported(new File(seqs[i].first).fsName);
+    if (again) {  // already imported: reload it (picks up re-rendered frames) instead of importing a duplicate
+        try { again.mainSource.reload(); } catch (e) {}
+        if (seqs[i].count > 1) again.mainSource.conformFrameRate = fps;
+        items.push({ item: again, s: seqs[i] });
+        continue;
+    }
     var io = new ImportOptions(new File(seqs[i].first));
     io.sequence = seqs[i].count > 1;
     io.forceAlphabetical = false;
@@ -376,31 +391,50 @@ items.sort(function (a, b) {
 var ref = items[0].item;
 var got = __getOrCreateComp(compName, size ? size[0] : ref.width, size ? size[1] : ref.height, fps, ref.duration);
 var comp = got.comp;
-var added = [];
+function layerName(x) { return x.s.pass === "multilayer" ? "Blender EXR (multilayer)" : "Blender " + x.s.pass; }
+for (var i = 0; i < items.length; i++) __removeLayersNamed(comp, layerName(items[i]));
+// The plate: the topmost enabled, opaque file-footage layer that is not one of our renders.
+var plate = null;
+for (var i = 1; i <= comp.numLayers && !plate; i++) {
+    var P = comp.layer(i);
+    if (!(P instanceof AVLayer) || P.nullLayer || P.adjustmentLayer || P.guideLayer || !P.enabled) continue;
+    var ps = P.source;
+    if (!(ps instanceof FootageItem) || !(ps.mainSource instanceof FileSource) || ps.mainSource.hasAlpha) continue;
+    if (ps.parentFolder === folder || /^Blender /.test(P.name)) continue;
+    plate = P;
+}
 var hasBeauty = false;
+for (var i = 0; i < items.length; i++) if (items[i].s.pass === "beauty") hasBeauty = true;
+var base = null, catcher = null, others = [], added = [];
 for (var i = 0; i < items.length; i++) {
     var x = items[i];
-    var name = x.s.pass === "multilayer" ? "Blender EXR (multilayer)" : "Blender " + x.s.pass;
-    __removeLayersNamed(comp, name);
     var L = comp.layers.add(x.item);
-    L.name = name;
+    L.name = layerName(x);
     L.startTime = 0;
-    L.moveToEnd();
-    var visible = x.s.pass === "beauty" || (x.s.pass === "multilayer" && !hasBeauty);
-    if (x.s.pass === "beauty") hasBeauty = true;
+    var isBase = x.s.pass === "beauty" || (x.s.pass === "multilayer" && !hasBeauty);
+    var isCatcher = x.s.pass === "shadowCatcher";
+    // The shadow catcher pass is the plate's shading (white = untouched): multiplied over the plate it adds the shadows.
+    var visible = isBase || (isCatcher && plate !== null);
     if (!visible) L.enabled = false;
-    if (BLEND[x.s.pass]) L.blendingMode = BlendingMode[BLEND[x.s.pass]];
+    var blend = isCatcher ? "MULTIPLY" : BLEND[x.s.pass];
+    if (blend) L.blendingMode = BlendingMode[blend];
     var fit = null;
     if (x.item.width !== comp.width) {
         fit = comp.width / x.item.width * 100;
         L.transform.scale.setValue([fit, fit]);
     }
-    added.push({ layer: L.name, frames: x.s.count, visible: visible, blend: BLEND[x.s.pass] || "NORMAL", scaledToFitPercent: fit });
+    if (isBase && !base) base = L; else if (isCatcher) catcher = L; else others.push(L);
+    added.push({ layer: L.name, frames: x.s.count, visible: visible, blend: blend || "NORMAL", scaledToFitPercent: fit });
 }
-// keep the beauty at the very bottom
-for (var i = comp.numLayers; i >= 1; i--) if (comp.layer(i).name === "Blender beauty") { comp.layer(i).moveToEnd(); break; }
-return { comp: comp.name, created: got.created, layers: added,
-         note: "EXR is linear: set the project to a linear working space / OCIO, or interpret footage as Linear Rec.709, to match Blender." };
+// Stack: [other passes, off] > beauty > shadow catcher (multiply) > plate. Without a plate everything goes to the bottom.
+if (plate) base.moveBefore(plate); else base.moveToEnd();
+if (catcher) catcher.moveAfter(base);
+for (var i = 0; i < others.length; i++) others[i].moveBefore(base);
+var order = [];
+for (var i = 1; i <= comp.numLayers; i++) order.push(comp.layer(i).name);
+var notes = ["EXR is linear: set the project to a linear working space / OCIO, or interpret footage as Linear Rec.709, to match Blender."];
+if (catcher && !plate) notes.push("No opaque footage layer (plate) found: the shadow catcher pass was left off at the bottom. Put it under the beauty and over the plate, in Multiply.");
+return { comp: comp.name, created: got.created, plate: plate ? plate.name : null, layers: added, order: order, notes: notes };
 `,
                     "blender-mcp: import_render_to_ae",
                     300_000

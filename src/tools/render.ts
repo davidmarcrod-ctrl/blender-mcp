@@ -109,12 +109,16 @@ return {"engine": rd.engine, "output_size": [w, h], "fps": round(fps(sc), 3), "f
         {
             title: "Preview render (EEVEE)",
             description:
-                "Renders a single frame with EEVEE at reduced size and returns the image so you can look at it. For fast look-dev iterations only; final renders are render_animation or the user's F12. The scene's own render settings are restored afterwards.",
+                "Renders a single frame with EEVEE at reduced size and returns the image so you can look at it. For fast look-dev iterations only; final renders are render_animation or the user's F12. The scene's own render settings are restored afterwards. Always renders the full frame unless useBorder is true (a render region crops the image and breaks compositing over the plate).",
             inputSchema: z.object({
                 frame: z.number().int().optional().describe("Default: current frame."),
                 percent: z.number().int().min(5).max(100).default(50),
                 samples: z.number().int().positive().default(16),
-                useSceneEngine: z.boolean().default(false).describe("Render with the scene's engine (e.g. Cycles) instead of forcing EEVEE. Slower.")
+                useSceneEngine: z.boolean().default(false).describe("Render with the scene's engine (e.g. Cycles) instead of forcing EEVEE. Slower."),
+                useBorder: z
+                    .boolean()
+                    .default(false)
+                    .describe("Honour the scene's render region (Ctrl+B border). Off by default: a region render is a crop, so compositor setups over the plate (shadow catcher, alpha over) do not line up.")
             })
         },
         async (args) =>
@@ -125,9 +129,11 @@ sc = scene()
 rd, im = sc.render, sc.render.image_settings
 saved = {"engine": rd.engine, "pct": rd.resolution_percentage, "media": im.media_type, "fmt": im.file_format,
          "depth": im.color_depth, "mode": im.color_mode, "frame": sc.frame_current,
-         "samples": sc.eevee.taa_render_samples}
+         "samples": sc.eevee.taa_render_samples, "border": rd.use_border}
 path = temp_png("preview")
 try:
+    # A region (border) render returns only a crop, which breaks any comp over the plate: always render the full frame.
+    rd.use_border = args["useBorder"]
     if not args["useSceneEngine"]:
         rd.engine = "BLENDER_EEVEE"
         sc.eevee.taa_render_samples = args["samples"]
@@ -142,6 +148,7 @@ try:
     bpy.data.images["Render Result"].save_render(filepath=path, scene=sc)
 finally:
     rd.engine = saved["engine"]
+    rd.use_border = saved["border"]
     rd.resolution_percentage = saved["pct"]
     sc.eevee.taa_render_samples = saved["samples"]
     im.media_type = saved["media"]
@@ -149,7 +156,10 @@ finally:
     im.color_depth = saved["depth"]
     im.color_mode = saved["mode"]
     sc.frame_set(saved["frame"])
-return {"frame": args.get("frame", saved["frame"]), "camera": sc.camera.name if sc.camera else None, "images": [path]}
+res = {"frame": args.get("frame", saved["frame"]), "camera": sc.camera.name if sc.camera else None, "images": [path]}
+if saved["border"] and not args["useBorder"]:
+    res["note"] = "The scene has a render region (border) set; it was ignored for this preview and left as it was."
+return res
 `,
                     args,
                     { timeoutMs: 300_000 }

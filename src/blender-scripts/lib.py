@@ -362,6 +362,7 @@ def _assign_footage_material(o, source, frame_offset):
         img.source = "SEQUENCE"
     elif source.get("is_movie"):
         img.source = "MOVIE"
+    img.size[0]  # loads the header, so the movie's colour space (e.g. Rec.2100-HLG) is detected now
     tex.image = img
     if img.source in ("SEQUENCE", "MOVIE"):
         tex.image_user.frame_duration = max(1, int(source.get("frames", 1)))
@@ -383,6 +384,31 @@ def _assign_footage_material(o, source, frame_offset):
         o.data.materials.append(mat)
     else:
         o.material_slots[0].material = mat
+
+
+# --- HDR footage -------------------------------------------------------------------------
+
+HDR_COLORSPACES = ("Rec.2100-HLG", "Rec.2100-PQ")
+HDR_HINT = ("HDR footage (iPhones record HLG / Dolby Vision). Blender decodes it as HDR, but After Effects in a "
+            "Rec.709 project shows the file without converting it, so the plate will look different in each app "
+            "(and the CG lit to match Blender will not match AE). To see in Blender what AE shows, set these to "
+            "'sRGB' with set_footage_colorspace.")
+
+
+def hdr_media():
+    """Movie clips and images whose colour space is HDR (Rec.2100 HLG/PQ)."""
+    out = []
+    for kind, coll in (("movieclip", bpy.data.movieclips), ("image", bpy.data.images)):
+        for d in coll:
+            cs = getattr(getattr(d, "colorspace_settings", None), "name", "")
+            if cs in HDR_COLORSPACES:
+                out.append({"kind": kind, "name": d.name, "colorspace": cs, "path": d.filepath})
+    return out
+
+
+def hdr_warning():
+    items = hdr_media()
+    return {"hdr_footage": items, "hint": HDR_HINT} if items else None
 
 
 # --- Render passes ---------------------------------------------------------------------

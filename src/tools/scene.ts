@@ -9,7 +9,7 @@ export function registerSceneTools(server: McpServer): void {
         {
             title: "Get scene info",
             description:
-                "Snapshot of the open Blender file: file path and unsaved state, scene frame range, fps, resolution, render engine, color management, active camera, collections, and object counts by type. Call this first in any session -- never assume objects exist or how they are named.",
+                "Snapshot of the open Blender file: file path and unsaved state, scene frame range, fps, resolution, render engine, color management, active camera, collections, object counts by type, movie clips with their colour space, and warnings (e.g. HDR footage that will not match After Effects). Call this first in any session -- never assume objects exist or how they are named.",
             inputSchema: z.object({})
         },
         async () =>
@@ -42,6 +42,9 @@ return {
     "collections": [{"name": c.name, "objects": len(c.objects), "children": [x.name for x in c.children]}
                     for c in sc.collection.children_recursive],
     "object_counts": types,
+    "movieclips": [{"name": c.name, "path": c.filepath, "colorspace": c.colorspace_settings.name,
+                    "size": list(c.size), "frames": c.frame_duration} for c in bpy.data.movieclips],
+    "warnings": [w for w in [hdr_warning()] if w],
 }
 `)
             )
@@ -288,6 +291,44 @@ return {"object": o.name, "material": mat.name, "slot": slot,
 `,
                     args,
                     { undo: "MCP: set material" }
+                )
+            )
+    );
+
+    server.registerTool(
+        "set_footage_colorspace",
+        {
+            title: "Set footage colour space",
+            description:
+                "Changes the colour space (Input Color Space) of movie clips and images. Main use: HDR footage. iPhones record HLG (Dolby Vision); Blender tags it Rec.2100-HLG and decodes it as HDR, while After Effects in a Rec.709 project shows the file unconverted, so the plate looks different in each app. Setting it to 'sRGB' makes Blender show what AE shows, so the CG is lit and judged against the same image. get_scene_info lists the HDR clips in its warnings. With no names, changes every HDR (Rec.2100 HLG/PQ) clip and image.",
+            inputSchema: z.object({
+                names: z.array(z.string()).optional().describe("Movie clip or image datablock names. Default: all HDR ones."),
+                colorspace: z.string().default("sRGB").describe("Target colour space, e.g. 'sRGB', 'Rec.2100-HLG', 'Linear Rec.709'.")
+            })
+        },
+        async (args) =>
+            runTool(() =>
+                runPython(
+                    `
+if args.get("names"):
+    targets = []
+    for n in args["names"]:
+        d = bpy.data.movieclips.get(n) or bpy.data.images.get(n)
+        if d is None:
+            raise KeyError(f"No movie clip or image named {n!r}")
+        targets.append(d)
+else:
+    targets = [(bpy.data.movieclips if m["kind"] == "movieclip" else bpy.data.images)[m["name"]] for m in hdr_media()]
+changed = []
+for d in targets:
+    before = d.colorspace_settings.name
+    d.colorspace_settings.name = args["colorspace"]
+    changed.append({"name": d.name, "kind": "movieclip" if isinstance(d, bpy.types.MovieClip) else "image",
+                    "from": before, "to": d.colorspace_settings.name})
+return {"changed": changed, "remaining_hdr": hdr_media()}
+`,
+                    args,
+                    { undo: "MCP: footage colour space" }
                 )
             )
     );

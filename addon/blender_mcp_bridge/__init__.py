@@ -10,7 +10,10 @@ it runs as `__mcp_main(args)` on Blender's main thread (bpy is not thread-safe),
 """
 
 import ast
+import datetime
+import glob
 import json
+import os
 import queue
 import socket
 import threading
@@ -220,6 +223,117 @@ def is_running():
     return bool(_server and _server.running)
 
 
+
+# --- Background jobs (render_animation, bake_simulation) ---------------------------------
+# The MCP server mirrors its jobs to ~/.blender-mcp/jobs/<server pid>.json; the panel shows them.
+# Cancelling creates ~/.blender-mcp/cancel/<job id>, which the server picks up.
+
+STATE_DIR = os.path.join(os.path.expanduser("~"), ".blender-mcp")
+_job_list = []
+_job_sig = None
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+
+
+def _read_jobs():
+    out = []
+    for path in glob.glob(os.path.join(STATE_DIR, "jobs", "*.json")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not _pid_alive(int(data.get("pid", 0))):
+            try:
+                os.remove(path)  # left behind by a server that crashed
+            except OSError:
+                pass
+            continue
+        out.extend(data.get("jobs", []))
+    running = [j for j in out if j.get("status") == "running"]
+    done = sorted([j for j in out if j.get("status") != "running"], key=lambda j: j.get("finishedAt") or "", reverse=True)
+    return running + done[:5]
+
+
+def _poll_jobs():
+    global _job_list, _job_sig
+    jobs = _read_jobs()
+    sig = json.dumps(jobs, sort_keys=True)
+    if sig != _job_sig:
+        _job_list, _job_sig = jobs, sig
+        for win in bpy.context.window_manager.windows:
+            for area in win.screen.areas:
+                if area.type == "VIEW_3D":
+                    area.tag_redraw()
+    return 1.0
+
+
+def _parse_time(text):
+    try:
+        return datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return None
+
+
+def _fmt_secs(s):
+    s = int(s)
+    return f"{s // 3600}h{s % 3600 // 60:02d}m" if s >= 3600 else f"{s // 60}m{s % 60:02d}s"
+
+
+def _draw_job(layout, job):
+    box = layout.box()
+    status = job.get("status")
+    kind = "Render" if job.get("kind") == "render" else "Bake"
+    icon = {"running": "RENDER_ANIMATION" if kind == "Render" else "PHYSICS", "finished": "CHECKMARK",
+            "failed": "ERROR", "cancelled": "CANCEL"}.get(status, "QUESTION")
+    head = box.row()
+    head.label(text=f"{kind} · {os.path.basename(job.get('file') or '')} · {job.get('scene')}", icon=icon)
+    total = max(1, job["frameEnd"] - job["frameStart"] + 1)
+    done = job.get("framesDone", 0)
+    if status == "running":
+        op = head.operator("mcp_bridge.cancel_job", text="", icon="X")
+        op.job_id = job["id"]
+        text = f"{done}/{total}"
+        if job.get("kind") == "bake" and job.get("stage"):
+            text += f" · {job['stage']}"
+        start = _parse_time(job.get("startedAt"))
+        if start and done:
+            elapsed = (datetime.datetime.now(datetime.timezone.utc) - start).total_seconds()
+            if job.get("kind") == "render":
+                text += f" · ~{_fmt_secs(elapsed / done * (total - done))} left"
+        box.progress(factor=done / total, type="BAR", text=text)
+    else:
+        line = f"{status} · {done}/{total} frames"
+        if job.get("kind") == "bake" and status == "finished":
+            applied = job.get("applied")
+            line += " · loaded" if applied is True else " · not loaded (ask Claude)"
+        box.label(text=line)
+
+
+class MCPBRIDGE_OT_cancel_job(bpy.types.Operator):
+    bl_idname = "mcp_bridge.cancel_job"
+    bl_label = "Cancel job"
+    bl_description = "Stop this background render or bake"
+
+    job_id: bpy.props.StringProperty()
+
+    def execute(self, context):
+        d = os.path.join(STATE_DIR, "cancel")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, self.job_id), "w"):
+            pass
+        self.report({"INFO"}, f"Cancelling {self.job_id}")
+        return {"FINISHED"}
+
+
 # --- UI ------------------------------------------------------------------------------
 
 def _prefs():
@@ -275,9 +389,14 @@ class MCPBRIDGE_PT_panel(bpy.types.Panel):
         else:
             layout.label(text="Stopped", icon="UNLINKED")
             layout.operator("mcp_bridge.start", icon="PLAY")
+        if _job_list:
+            layout.separator()
+            layout.label(text="Background jobs")
+            for job in _job_list:
+                _draw_job(layout, job)
 
 
-_classes = (MCPBRIDGE_Preferences, MCPBRIDGE_OT_start, MCPBRIDGE_OT_stop, MCPBRIDGE_PT_panel)
+_classes = (MCPBRIDGE_Preferences, MCPBRIDGE_OT_start, MCPBRIDGE_OT_stop, MCPBRIDGE_OT_cancel_job, MCPBRIDGE_PT_panel)
 
 
 def _auto_start():
@@ -294,9 +413,13 @@ def register():
         bpy.utils.register_class(cls)
     # Deferred: preferences aren't fully available during register at startup.
     bpy.app.timers.register(_auto_start, first_interval=0.5)
+    if not bpy.app.background:
+        bpy.app.timers.register(_poll_jobs, first_interval=1.0, persistent=True)
 
 
 def unregister():
     stop_server()
+    if bpy.app.timers.is_registered(_poll_jobs):
+        bpy.app.timers.unregister(_poll_jobs)
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)

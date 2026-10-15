@@ -4,6 +4,8 @@ import { registerFileTools } from "./tools/file.js";
 import { registerSceneTools } from "./tools/scene.js";
 import { registerAnimationTools } from "./tools/animation.js";
 import { registerRenderTools } from "./tools/render.js";
+import { registerBakeTools } from "./tools/bake.js";
+import { registerSolveTools } from "./tools/solve.js";
 import { registerAeLinkTools } from "./tools/ae-link.js";
 import { registerEscapeHatchTool } from "./tools/escape_hatch.js";
 
@@ -13,6 +15,8 @@ registerFileTools(server);
 registerSceneTools(server);
 registerAnimationTools(server);
 registerRenderTools(server);
+registerBakeTools(server);
+registerSolveTools(server);
 registerAeLinkTools(server);
 registerEscapeHatchTool(server);
 

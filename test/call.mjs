@@ -1,4 +1,5 @@
 // Minimal MCP stdio client for manual testing: node test/call.mjs '<tool>' '<json args>' [...more pairs]
+// FULL=1 prints whole text results (default: first 2500 chars).
 import { spawn } from "node:child_process";
 const srv = spawn("node", [new URL("../dist/index.js", import.meta.url).pathname], { stdio: ["pipe", "pipe", "inherit"] });
 let buf = "", id = 0;
@@ -27,6 +28,6 @@ if (argv[0] === "--list") {
     console.log(`=== ${argv[k]} ${r.result?.isError ? "ERROR" : "ok"}`);
     if (r.error) console.log(JSON.stringify(r.error));
     try { const j = JSON.parse(r.result.content[0].text); if (j.jobId) globalThis.JOB = j.jobId; } catch {}
-    for (const c of r.result?.content ?? []) console.log(c.type === "text" ? c.text.slice(0, 2500) : `[image ${c.mimeType} ${c.data.length} b64 chars]`);
+    for (const c of r.result?.content ?? []) console.log(c.type === "text" ? (process.env.FULL ? c.text : c.text.slice(0, 2500)) : `[image ${c.mimeType} ${c.data.length} b64 chars]`);
 }
 srv.kill();

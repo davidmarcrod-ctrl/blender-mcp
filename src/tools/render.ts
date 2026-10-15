@@ -1,41 +1,12 @@
 import { z } from "zod";
-import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { unlink } from "node:fs/promises";
 import type { McpServer } from "@modelcontextprotocol/server";
 import { runPython } from "../blender-bridge.js";
 import { runTool } from "../tool-helpers.js";
 import { BLENDER_BIN } from "./file.js";
-
-export interface RenderJob {
-    id: string;
-    status: "running" | "finished" | "failed" | "cancelled";
-    blendCopy: string;
-    scene: string;
-    frameStart: number;
-    frameEnd: number;
-    currentFrame: number | null;
-    framesDone: number;
-    savedFiles: string[];
-    outputDir: string;
-    passesDir: string | null;
-    fps: number;
-    width: number;
-    height: number;
-    startedAt: string;
-    finishedAt?: string;
-    exitCode?: number | null;
-    logTail: string[];
-    kill?: () => void;
-}
-
-export const renderJobs = new Map<string, RenderJob>();
-
-function publicJob(job: RenderJob) {
-    const { kill: _kill, ...rest } = job;
-    const total = job.frameEnd - job.frameStart + 1;
-    return { ...rest, savedFiles: job.savedFiles.slice(-10), savedCount: job.savedFiles.length, progress: `${job.framesDone}/${total}` };
-}
+import { applyBake } from "./bake.js";
+import { cancelJob, jobs, publicJob, runJobProcess, type RenderJob } from "../jobs.js";
 
 export function registerRenderTools(server: McpServer): void {
     server.registerTool(
@@ -268,7 +239,7 @@ return result
         {
             title: "Render animation (background)",
             description:
-                "Renders the frame range in a separate background Blender process from a saved snapshot of the current file, so the user's Blender stays usable. Returns a jobId immediately; poll with get_render_status. This spends machine time (a Cycles shot can take hours): confirm frame range, engine and samples with the user before starting. The file must have been saved at least once (the snapshot is written next to it so // paths keep working).",
+                "Renders the frame range in a separate background Blender process from a saved snapshot of the current file, so the user's Blender stays usable. Returns a jobId immediately; poll with get_render_status. Progress also shows in Blender's sidebar (N) > MCP. This spends machine time (a Cycles shot can take hours): confirm frame range, engine and samples with the user before starting. The file must have been saved at least once (the snapshot is written next to it so // paths keep working).",
             inputSchema: z.object({
                 frameStart: z.number().int().optional(),
                 frameEnd: z.number().int().optional(),
@@ -279,6 +250,7 @@ return result
             runTool(async () => {
                 const info = await runPython<{
                     copy: string;
+                    file: string;
                     scene: string;
                     start: number;
                     end: number;
@@ -299,7 +271,7 @@ bpy.ops.wm.save_as_mainfile(filepath=copy, copy=True)
 ng = sc.compositing_node_group
 fo = ng.nodes.get(PASS_NODE_NAME) if ng else None
 w, h = render_size(sc)
-return {"copy": copy, "scene": sc.name,
+return {"copy": copy, "file": bpy.data.filepath, "scene": sc.name,
         "start": args.get("frameStart") if args.get("frameStart") is not None else sc.frame_start,
         "end": args.get("frameEnd") if args.get("frameEnd") is not None else sc.frame_end,
         "output_dir": os.path.dirname(bpy.path.abspath(sc.render.filepath)),
@@ -310,13 +282,16 @@ return {"copy": copy, "scene": sc.name,
                 );
                 const job: RenderJob = {
                     id: randomUUID().slice(0, 8),
+                    kind: "render",
                     status: "running",
+                    file: info.file,
                     blendCopy: info.copy,
                     scene: info.scene,
                     frameStart: info.start,
                     frameEnd: info.end,
                     currentFrame: null,
                     framesDone: 0,
+                    stage: null,
                     savedFiles: [],
                     outputDir: info.output_dir,
                     passesDir: info.passes_dir,
@@ -326,19 +301,14 @@ return {"copy": copy, "scene": sc.name,
                     startedAt: new Date().toISOString(),
                     logTail: []
                 };
-                const child = spawn(
+                const framesSeen = new Set<number>();
+                runJobProcess(
+                    job,
                     BLENDER_BIN,
                     ["-b", info.copy, "-S", info.scene, "-s", String(info.start), "-e", String(info.end), "-a"],
-                    { stdio: ["ignore", "pipe", "pipe"] }
-                );
-                job.kill = () => child.kill("SIGTERM");
-                const framesSeen = new Set<number>();
-                const onLine = (line: string) => {
-                    if (!line.trim()) return;
-                    job.logTail.push(line);
-                    if (job.logTail.length > 30) job.logTail.shift();
-                    const saved = /Saved: '(.+)'/.exec(line);
-                    if (saved) {
+                    (line) => {
+                        const saved = /Saved: '(.+)'/.exec(line);
+                        if (!saved) return;
                         job.savedFiles.push(saved[1]);
                         // Blender 5.x no longer prints "Fra:" lines: take the frame from the file name
                         const num = /(\d+)\.\w+$/.exec(saved[1]);
@@ -347,24 +317,11 @@ return {"copy": copy, "scene": sc.name,
                             framesSeen.add(job.currentFrame);
                             job.framesDone = framesSeen.size;
                         }
+                    },
+                    async () => {
+                        if (!args.keepSnapshot) await unlink(info.copy).catch(() => {});
                     }
-                };
-                let pending = "";
-                const feed = (chunk: Buffer) => {
-                    pending += chunk.toString("utf8");
-                    const lines = pending.split("\n");
-                    pending = lines.pop() ?? "";
-                    lines.forEach(onLine);
-                };
-                child.stdout.on("data", feed);
-                child.stderr.on("data", feed);
-                child.on("close", async (code) => {
-                    if (job.status === "running") job.status = code === 0 ? "finished" : "failed";
-                    job.exitCode = code;
-                    job.finishedAt = new Date().toISOString();
-                    if (!args.keepSnapshot) await unlink(info.copy).catch(() => {});
-                });
-                renderJobs.set(job.id, job);
+                );
                 return { jobId: job.id, ...publicJob(job) };
             })
     );
@@ -372,18 +329,26 @@ return {"copy": copy, "scene": sc.name,
     server.registerTool(
         "get_render_status",
         {
-            title: "Get render status",
-            description: "Progress of background renders started with render_animation (frames done, last saved files, log tail). Omit jobId to list all jobs of this session. cancel=true stops the job.",
-            inputSchema: z.object({ jobId: z.string().optional(), cancel: z.boolean().default(false) })
+            title: "Get job status",
+            description:
+                "Progress of background jobs: renders from render_animation and simulation bakes from bake_simulation (frames done, stage, last saved files, log tail). Omit jobId to list all jobs of this session. cancel=true stops the job. For a finished bake that was not applied (the user's file had unsaved changes), apply=true loads the baked file into Blender; add discardChanges=true only after the user agreed to lose those changes. The same jobs and their progress show in Blender's sidebar (N) > MCP, where the user can also cancel them.",
+            inputSchema: z.object({
+                jobId: z.string().optional(),
+                cancel: z.boolean().default(false),
+                apply: z.boolean().default(false).describe("Bake jobs only: load the baked file into the user's Blender."),
+                discardChanges: z.boolean().default(false)
+            })
         },
-        async ({ jobId, cancel }) =>
+        async ({ jobId, cancel, apply, discardChanges }) =>
             runTool(async () => {
-                if (!jobId) return [...renderJobs.values()].map(publicJob);
-                const job = renderJobs.get(jobId);
-                if (!job) throw new Error(`No render job ${jobId}. Jobs: ${[...renderJobs.keys()].join(", ") || "none"}`);
-                if (cancel && job.status === "running") {
-                    job.status = "cancelled";
-                    job.kill?.();
+                if (!jobId) return [...jobs.values()].map(publicJob);
+                const job = jobs.get(jobId);
+                if (!job) throw new Error(`No job ${jobId}. Jobs: ${[...jobs.keys()].join(", ") || "none"}`);
+                if (cancel) cancelJob(job);
+                if (apply) {
+                    if (job.kind !== "bake") throw new Error("apply is for bake jobs");
+                    if (job.status !== "finished") throw new Error(`Bake ${job.id} is ${job.status}`);
+                    await applyBake(job, discardChanges);
                 }
                 return publicJob(job);
             })

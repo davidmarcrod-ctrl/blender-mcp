@@ -6,7 +6,7 @@ import { runPython } from "../blender-bridge.js";
 import { runExtendScript, runExtendScriptInUndoGroup } from "../ae/ae-bridge.js";
 import { jsxLiteral } from "../ae/jsx-literal.js";
 import { runTool } from "../tool-helpers.js";
-import { renderJobs } from "./render.js";
+import { jobs } from "../jobs.js";
 
 const PPM = z
     .number()
@@ -311,8 +311,8 @@ return {"objects": apply_from_ae(data, args["ppm"], args["collection"], args["se
                 let compName = args.compName;
                 let size: number[] | null = null;
                 if (args.jobId) {
-                    const job = renderJobs.get(args.jobId);
-                    if (!job) throw new Error(`No render job ${args.jobId}`);
+                    const job = jobs.get(args.jobId);
+                    if (!job || job.kind !== "render") throw new Error(`No render job ${args.jobId}`);
                     if (job.status === "running") throw new Error(`Job ${job.id} is still rendering (${job.framesDone} frames done)`);
                     dirs = [job.outputDir, ...(job.passesDir ? [job.passesDir] : [])];
                     fps ??= job.fps;

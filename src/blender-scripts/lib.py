@@ -462,8 +462,8 @@ def set_pass(view_layer, key, value):
     return True
 
 
-def setup_separate_outputs(sc, directory, prefix, depth, codec):
-    """Adds/refreshes a File Output node writing each non-crypto pass to its own EXR sequence."""
+def compositor_tree(sc):
+    """The scene's compositor node group, created (Render Layers -> Group Output) if missing."""
     if hasattr(sc.render, "use_compositing"):
         sc.render.use_compositing = True
     ng = sc.compositing_node_group
@@ -477,14 +477,11 @@ def setup_separate_outputs(sc, directory, prefix, depth, codec):
         go = ng.nodes.new("NodeGroupOutput")
         go.location = (200, 150)
         ng.links.new(rl_new.outputs["Image"], go.inputs[0])
-    rl = next((n for n in ng.nodes if n.bl_idname == "CompositorNodeRLayers"), None)
-    if rl is None:
-        rl = ng.nodes.new("CompositorNodeRLayers")
-    fo = ng.nodes.get(PASS_NODE_NAME)
-    if fo is None:
-        fo = ng.nodes.new("CompositorNodeOutputFile")
-        fo.name = fo.label = PASS_NODE_NAME
-        fo.location = (rl.location.x + 400, rl.location.y - 200)
+    return ng
+
+
+def fill_file_output(ng, rl, fo, directory, prefix, depth, codec):
+    """Points a File Output node at directory/prefix and wires every enabled non-crypto pass of rl to it."""
     fo.directory = directory
     fo.file_name = prefix
     fo.format.media_type = "IMAGE"
@@ -504,12 +501,330 @@ def setup_separate_outputs(sc, directory, prefix, depth, codec):
     return written
 
 
+def setup_separate_outputs(sc, directory, prefix, depth, codec):
+    """Adds/refreshes a File Output node writing each non-crypto pass to its own EXR sequence."""
+    ng = compositor_tree(sc)
+    rl = next((n for n in ng.nodes if n.bl_idname == "CompositorNodeRLayers" and not n.name.startswith(ELEMENT_RL_PREFIX)), None)
+    if rl is None:
+        rl = ng.nodes.new("CompositorNodeRLayers")
+    fo = ng.nodes.get(PASS_NODE_NAME)
+    if fo is None:
+        fo = ng.nodes.new("CompositorNodeOutputFile")
+        fo.name = fo.label = PASS_NODE_NAME
+        fo.location = (rl.location.x + 400, rl.location.y - 200)
+    return fill_file_output(ng, rl, fo, directory, prefix, depth, codec)
+
+
 def remove_separate_outputs(sc):
     ng = sc.compositing_node_group
     if ng and ng.nodes.get(PASS_NODE_NAME):
         ng.nodes.remove(ng.nodes[PASS_NODE_NAME])
         return True
     return False
+
+
+# --- One view layer per element (per-element, per-pass output for AE) -----------------
+
+ELEMENT_RL_PREFIX = "MCP Element RL: "
+ELEMENT_FO_PREFIX = "MCP Element Output: "
+ELEMENTS_PROP = "mcp_elements"            # scene prop: {element: [collection names]}, in order
+DISABLED_LAYERS_PROP = "mcp_disabled_layers"  # scene prop: the user's view layers switched off for it
+SHADOW_LAYERS_PROP = "mcp_element_shadow_layers"  # scene prop: shadow-only layers (shadows="per_element")
+SHADOWS_PROP = "mcp_element_shadows"      # scene prop: "shared", "per_element" or "none"
+
+
+def safe_name(s):
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", s).strip("_") or "element"
+
+
+def find_layer_collection(lc, coll):
+    if lc.collection == coll:
+        return lc
+    for c in lc.children:
+        found = find_layer_collection(c, coll)
+        if found:
+            return found
+    return None
+
+
+def _walk_layer_collections(lc):
+    yield lc
+    for c in lc.children:
+        yield from _walk_layer_collections(c)
+
+
+def element_names(sc):
+    data = sc.get(ELEMENTS_PROP)
+    return list(data.keys()) if data else []
+
+
+def _resolve_elements(sc, elements):
+    """{element: [collection or object names]} -> {safe name: [collections]}. Loose objects are moved
+    into a collection named after the element (holdout works per collection, not per object)."""
+    in_scene = set(sc.collection.children_recursive)
+    out, moved = {}, []
+    for raw, members in elements.items():
+        name = safe_name(raw)
+        if name in out:
+            raise ValueError(f"Two elements end up named {name!r}")
+        colls, loose = [], []
+        for m in members:
+            c = bpy.data.collections.get(m)
+            if c is not None:
+                if c not in in_scene:
+                    raise ValueError(f"Collection {m!r} is not in scene {sc.name!r} (or is the scene's root)")
+                colls.append(c)
+            else:
+                loose.append(get_object(m))
+        if loose:
+            target = bpy.data.collections.get(name)
+            if target is None or target not in in_scene:
+                target = bpy.data.collections.new(name)
+                sc.collection.children.link(target)
+            for o in loose:
+                if o.users_collection != (target,):
+                    for c in list(o.users_collection):
+                        c.objects.unlink(o)
+                    target.objects.link(o)
+                    moved.append({"object": o.name, "to_collection": target.name})
+            if target not in colls:
+                colls.append(target)
+        if not colls:
+            raise ValueError(f"Element {raw!r} has no collections or objects")
+        out[name] = colls
+    flat = [(n, c) for n, cs in out.items() for c in cs]
+    for i, (n1, c1) in enumerate(flat):
+        for n2, c2 in flat[i + 1:]:
+            if n1 != n2 and (c1 == c2 or c2 in c1.children_recursive or c1 in c2.children_recursive):
+                raise ValueError(f"Elements {n1!r} and {n2!r} share collection {c1.name!r}/{c2.name!r}: "
+                                 "each object must belong to one element")
+    return out, moved
+
+
+def _remove_element_nodes(sc, keep=()):
+    ng = sc.compositing_node_group
+    removed = []
+    if ng:
+        for n in list(ng.nodes):
+            for pre in (ELEMENT_RL_PREFIX, ELEMENT_FO_PREFIX):
+                if n.name.startswith(pre) and n.name[len(pre):] not in keep:
+                    removed.append(n.name)
+                    ng.nodes.remove(n)
+                    break
+    return removed
+
+
+def _relink_group_output(sc, rl):
+    """Points the compositor's Group Output at rl if it is fed by a layer that will not render."""
+    ng = sc.compositing_node_group
+    go = next((n for n in ng.nodes if n.bl_idname == "NodeGroupOutput"), None) if ng else None
+    if go is None or not go.inputs:
+        return
+    src = go.inputs[0].links[0].from_node if go.inputs[0].is_linked else None
+    layer = sc.view_layers.get(getattr(src, "layer", "")) if src else None
+    if src is None or (src.bl_idname == "CompositorNodeRLayers" and (layer is None or not layer.use)):
+        ng.links.new(rl.outputs["Image"], go.inputs[0])
+
+
+def _apply_layer_state(vl, tmpl_state, resolved, own, others):
+    """Collection flags of one element layer: the template's for the set, `others` for the other elements."""
+    for lc in _walk_layer_collections(vl.layer_collection):
+        if lc == vl.layer_collection:
+            continue
+        ex, ho, io = tmpl_state.get(lc.collection.name, (False, False, False))
+        lc.exclude = ex
+        if not ex:
+            lc.holdout, lc.indirect_only = ho, io
+    for other, ocolls in resolved.items():
+        for c in ocolls:
+            lc = find_layer_collection(vl.layer_collection, c)
+            mine = other == own
+            lc.exclude = (not mine) and others == "exclude"
+            if not lc.exclude:
+                lc.holdout = (not mine) and others == "holdout"
+                lc.indirect_only = (not mine) and others == "indirect_only"
+
+
+def _get_node(ng, name, kind, location):
+    n = ng.nodes.get(name)
+    if n is None:
+        n = ng.nodes.new(kind)
+        n.name = n.label = name
+    n.location = location
+    return n
+
+
+def setup_element_layers(sc, elements, others, passes, out_dir, depth, codec, catcher_names, disable_user_layers, shadows):
+    resolved, moved = _resolve_elements(sc, elements)
+    warnings = []
+    cycles = sc.render.engine == "CYCLES"
+    if others == "indirect_only" and not cycles:
+        warnings.append("indirect_only only works in Cycles; with this engine the other elements render as if fully visible.")
+
+    geometry = {"MESH", "CURVE", "SURFACE", "META", "FONT", "POINTCLOUD", "VOLUME", "CURVES"}
+    catchers = {o for o in sc.objects if o.type in geometry and getattr(o, "is_shadow_catcher", False)}
+    for n in catcher_names or []:
+        o = get_object(n)
+        o.is_shadow_catcher = True
+        catchers.add(o)
+    for o in catchers:
+        for name, colls in resolved.items():
+            if any(o.name in c.all_objects for c in colls):
+                warnings.append(f"Shadow catcher {o.name!r} is inside element {name!r}: the other layers will not "
+                                "show it. Keep catchers outside the elements.")
+    if catchers and not cycles:
+        warnings.append("Shadow catchers need Cycles.")
+    # Held-out / indirect-only objects still cast shadows, so every layer's catcher pass holds every
+    # element's shadow ("shared"). "per_element" adds a shadow-only layer per element with the others excluded.
+    use_catcher = bool(catchers) and cycles
+    if others == "exclude":
+        shadows = "per_element"
+    extra_shadow_layers = use_catcher and shadows == "per_element" and others != "exclude"
+    shadow_layers = {f"{n}_shadow": n for n in resolved} if extra_shadow_layers else {}
+
+    prev = set(element_names(sc)) | set(sc.get(SHADOW_LAYERS_PROP, []))
+    ours = set(resolved) | set(shadow_layers)
+    # Template for collections that are not elements: the user's own layer (keeps their excludes/holdouts).
+    template = next((vl for vl in sc.view_layers if vl.name not in prev and vl.name not in ours), None)
+    tmpl_state = {}
+    if template:
+        for lc in _walk_layer_collections(template.layer_collection):
+            tmpl_state[lc.collection.name] = (lc.exclude, lc.holdout, lc.indirect_only)
+    for vl in list(sc.view_layers):  # elements dropped since the last run
+        if vl.name in prev and vl.name not in ours:
+            sc.view_layers.remove(vl)
+
+    def layer(name):
+        vl = sc.view_layers.get(name)
+        if vl is None:
+            vl = sc.view_layers.new(name)
+        elif name not in prev:
+            raise ValueError(f"A view layer named {name!r} already exists and is not an element layer: rename the element")
+        vl.use = True
+        return vl
+
+    out_dir = out_dir if out_dir.endswith("/") else out_dir + "/"
+    wanted = [p.lower() for p in passes]
+    if use_catcher and "shadow_catcher" not in wanted:
+        wanted.append("shadow_catcher")
+    ng = compositor_tree(sc)
+    removed_single = remove_separate_outputs(sc)
+    result_layers, first_rl = [], None
+    for i, (name, colls) in enumerate(resolved.items()):
+        vl = layer(name)
+        _apply_layer_state(vl, tmpl_state, resolved, name, others)
+        enabled, skipped = [], []
+        for key in wanted:
+            (enabled if set_pass(vl, key, True) else skipped).append(key)
+        y = -600 * i - 400
+        rl = _get_node(ng, ELEMENT_RL_PREFIX + name, "CompositorNodeRLayers", (-700, y))
+        rl.layer = name
+        fo = _get_node(ng, ELEMENT_FO_PREFIX + name, "CompositorNodeOutputFile", (-300, y))
+        written = fill_file_output(ng, rl, fo, out_dir + name + "/", name + "_", depth, codec)
+        first_rl = first_rl or rl
+        entry = {"element": name, "view_layer": vl.name, "collections": [c.name for c in colls],
+                 "enabled": enabled, "not_available_for_engine": skipped,
+                 "directory": bpy.path.abspath(out_dir + name + "/"), "files": written}
+        if extra_shadow_layers:
+            sname = f"{name}_shadow"
+            svl = layer(sname)
+            _apply_layer_state(svl, tmpl_state, resolved, name, "exclude")
+            set_pass(svl, "shadow_catcher", True)
+            srl = _get_node(ng, ELEMENT_RL_PREFIX + sname, "CompositorNodeRLayers", (-700, y - 300))
+            srl.layer = sname
+            if "shadowCatcher_" in fo.inputs and "Shadow Catcher" in srl.outputs:
+                ng.links.new(srl.outputs["Shadow Catcher"], fo.inputs["shadowCatcher_"])
+            entry["shadow_layer"] = sname
+        result_layers.append(entry)
+    removed_nodes = _remove_element_nodes(sc, keep=ours)
+
+    disabled = list(sc.get(DISABLED_LAYERS_PROP, []))
+    if disable_user_layers:
+        for vl in sc.view_layers:
+            if vl.name not in ours and vl.use:
+                vl.use = False
+                disabled.append(vl.name)
+    sc[DISABLED_LAYERS_PROP] = sorted(set(disabled))
+    sc[ELEMENTS_PROP] = {n: [c.name for c in cs] for n, cs in resolved.items()}
+    sc[SHADOW_LAYERS_PROP] = sorted(shadow_layers)
+    sc[SHADOWS_PROP] = ("per_element" if shadows == "per_element" else "shared") if use_catcher else "none"
+    _relink_group_output(sc, first_rl)
+    return {"elements": result_layers, "others": others, "shadow_catchers": sorted(o.name for o in catchers),
+            "shadows": sc[SHADOWS_PROP], "moved_objects": moved, "user_layers_off": sc[DISABLED_LAYERS_PROP],
+            "removed_single_layer_pass_node": removed_single, "removed_nodes": removed_nodes, "warnings": warnings}
+
+
+def remove_element_layers(sc):
+    names = element_names(sc) + list(sc.get(SHADOW_LAYERS_PROP, []))
+    for n in names:
+        vl = sc.view_layers.get(n)
+        if vl and len(sc.view_layers) > 1:
+            sc.view_layers.remove(vl)
+    removed_nodes = _remove_element_nodes(sc)
+    restored = []
+    for n in sc.get(DISABLED_LAYERS_PROP, []):
+        vl = sc.view_layers.get(n)
+        if vl and not vl.use:
+            vl.use = True
+            restored.append(n)
+    for k in (ELEMENTS_PROP, DISABLED_LAYERS_PROP, SHADOW_LAYERS_PROP, SHADOWS_PROP):
+        if k in sc:
+            del sc[k]
+    ng = sc.compositing_node_group
+    rl = next((n for n in ng.nodes if n.bl_idname == "CompositorNodeRLayers"), None) if ng else None
+    if rl and sc.view_layers.get(rl.layer) is None:
+        rl.layer = sc.view_layers[0].name
+    if rl:
+        _relink_group_output(sc, rl)
+    return {"removed_view_layers": names, "removed_nodes": removed_nodes, "user_layers_back_on": restored}
+
+
+def element_depths(sc):
+    """Median distance from the camera of each element's rendered objects at the current frame."""
+    data = sc.get(ELEMENTS_PROP)
+    cam = sc.camera
+    if not data or cam is None:
+        return {}
+    owner = {}
+    for name, colls in data.items():
+        for cn in colls:
+            c = bpy.data.collections.get(cn)
+            for o in (c.all_objects if c else []):
+                owner[o.name] = name
+    inv = cam.matrix_world.inverted()
+    dg = bpy.context.evaluated_depsgraph_get()
+    dist = {}
+    for inst in dg.object_instances:
+        o = inst.instance_object if inst.is_instance else inst.object
+        if o is None or o.type not in {"MESH", "CURVE", "SURFACE", "META", "FONT", "POINTCLOUD", "VOLUME", "CURVES"}:
+            continue
+        el = owner.get(o.original.name)
+        if el is None and inst.is_instance and inst.parent:
+            el = owner.get(inst.parent.original.name)
+        if el is None:
+            continue
+        center = sum((Vector(c) for c in o.bound_box), Vector()) / 8
+        dist.setdefault(el, []).append(-(inv @ (inst.matrix_world @ center)).z)
+    return {el: round(sorted(v)[len(v) // 2], 3) for el, v in dist.items()}
+
+
+def element_outputs(sc):
+    """[{name, dir, depth}] for the element layers that will render, nearest to the camera first
+    (setup order when a depth is missing)."""
+    ng = sc.compositing_node_group
+    out = []
+    for name in element_names(sc):
+        vl = sc.view_layers.get(name)
+        fo = ng.nodes.get(ELEMENT_FO_PREFIX + name) if ng else None
+        if vl is None or not vl.use or fo is None or fo.mute:
+            continue
+        out.append({"name": name, "dir": bpy.path.abspath(fo.directory)})
+    depths = element_depths(sc)
+    for e in out:
+        e["depth"] = depths.get(e["name"])
+    if out and all(e["depth"] is not None for e in out):
+        out.sort(key=lambda e: e["depth"])
+    return out
 
 
 # --- Images for the model to look at --------------------------------------------------

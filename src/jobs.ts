@@ -15,6 +15,9 @@ const JOBS_DIR = join(STATE_DIR, "jobs");
 const CANCEL_DIR = join(STATE_DIR, "cancel");
 const STATE_FILE = join(JOBS_DIR, `${process.pid}.json`);
 
+/** Written next to a per-element render (render_animation) so import_render_to_ae can find the elements later. */
+export const ELEMENTS_FILE = "mcp_elements.json";
+
 export type JobStatus = "running" | "finished" | "failed" | "cancelled";
 
 interface JobBase {
@@ -42,6 +45,10 @@ export interface RenderJob extends JobBase {
     savedFiles: string[];
     outputDir: string;
     passesDir: string | null;
+    /** setup_element_layers output: one folder per element, nearest to the camera first. */
+    elements: { name: string; dir: string; depth: number | null }[] | null;
+    /** "shared": every element's shadow catcher pass holds all the shadows (use one); "per_element": each its own. */
+    elementShadows: "shared" | "per_element" | "none" | null;
     fps: number;
     width: number;
     height: number;

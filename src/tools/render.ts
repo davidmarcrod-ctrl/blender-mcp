@@ -1,12 +1,13 @@
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
-import { unlink } from "node:fs/promises";
+import { mkdir, unlink, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/server";
 import { runPython } from "../blender-bridge.js";
 import { runTool } from "../tool-helpers.js";
 import { BLENDER_BIN } from "./file.js";
 import { applyBake } from "./bake.js";
-import { cancelJob, jobs, publicJob, runJobProcess, type RenderJob } from "../jobs.js";
+import { cancelJob, ELEMENTS_FILE, jobs, publicJob, runJobProcess, type RenderJob } from "../jobs.js";
 
 export function registerRenderTools(server: McpServer): void {
     server.registerTool(
@@ -89,7 +90,11 @@ return {"engine": rd.engine, "output_size": [w, h], "fps": round(fps(sc), 3), "f
                 useBorder: z
                     .boolean()
                     .default(false)
-                    .describe("Honour the scene's render region (Ctrl+B border). Off by default: a region render is a crop, so compositor setups over the plate (shadow catcher, alpha over) do not line up.")
+                    .describe("Honour the scene's render region (Ctrl+B border). Off by default: a region render is a crop, so compositor setups over the plate (shadow catcher, alpha over) do not line up."),
+                viewLayer: z
+                    .string()
+                    .optional()
+                    .describe("Render only this view layer and return its own image (e.g. one element from setup_element_layers). Default: the scene's render result (composite).")
             })
         },
         async (args) =>
@@ -102,6 +107,14 @@ saved = {"engine": rd.engine, "pct": rd.resolution_percentage, "media": im.media
          "depth": im.color_depth, "mode": im.color_mode, "frame": sc.frame_current,
          "samples": sc.eevee.taa_render_samples, "border": rd.use_border}
 path = temp_png("preview")
+# File Output nodes would write this small preview into the render folders: mute them meanwhile.
+ng = sc.compositing_node_group
+muted = [n for n in (ng.nodes if ng else []) if n.bl_idname == "CompositorNodeOutputFile" and not n.mute]
+for n in muted:
+    n.mute = True
+vl_name = args.get("viewLayer")
+if vl_name and sc.view_layers.get(vl_name) is None:
+    raise KeyError(f"No view layer {vl_name!r}. Layers: {[v.name for v in sc.view_layers]}")
 try:
     # A region (border) render returns only a crop, which breaks any comp over the plate: always render the full frame.
     rd.use_border = args["useBorder"]
@@ -115,9 +128,22 @@ try:
     im.file_format = "PNG"
     im.color_depth = "8"
     im.color_mode = "RGBA"
+    if vl_name:
+        # Only that layer renders, without the compositor, so the result is its own image.
+        saved["use"] = {v.name: v.use for v in sc.view_layers}
+        saved["comp"] = rd.use_compositing
+        for v in sc.view_layers:
+            v.use = v.name == vl_name
+        rd.use_compositing = False
     bpy.ops.render.render()
     bpy.data.images["Render Result"].save_render(filepath=path, scene=sc)
 finally:
+    for n in muted:
+        n.mute = False
+    if "use" in saved:
+        for v in sc.view_layers:
+            v.use = saved["use"].get(v.name, v.use)
+        rd.use_compositing = saved["comp"]
     rd.engine = saved["engine"]
     rd.use_border = saved["border"]
     rd.resolution_percentage = saved["pct"]
@@ -128,6 +154,8 @@ finally:
     im.color_mode = saved["mode"]
     sc.frame_set(saved["frame"])
 res = {"frame": args.get("frame", saved["frame"]), "camera": sc.camera.name if sc.camera else None, "images": [path]}
+if vl_name:
+    res["view_layer"] = vl_name
 if saved["border"] and not args["useBorder"]:
     res["note"] = "The scene has a render region (border) set; it was ignored for this preview and left as it was."
 return res
@@ -235,11 +263,76 @@ return result
     );
 
     server.registerTool(
+        "setup_element_layers",
+        {
+            title: "Set up one view layer per element for AE",
+            description:
+                "Per-element, per-pass output for After Effects: each element (e.g. the ball, the confetti) gets its own view layer and its own folder of EXR sequences, one file per pass: //render/<scene>/<element>/<element>_<pass>_####.exr (plus the scene's multilayer EXR with every layer and Cryptomatte). In each element's layer the other elements are holdout by default (cut out where they pass in front, so the layers stack cleanly in AE), or indirect_only (Cycles: invisible but still cast shadows, reflect and bounce light) or exclude (gone entirely). Shadow catchers (objects with is_shadow_catcher, plus `shadowCatchers`) stay visible in every layer and the shadow_catcher pass is added (Cycles). Elements are given as {name: [collection or object names]}; loose objects are MOVED into a collection named after the element (holdout works per collection). Things in no element (set, lights, catchers) render in every layer. The user's own view layers are switched off for the render (they come back with remove=true). Idempotent: re-run with the full element list to update; elements left out are removed. Replaces the single-layer 'MCP Pass Output' node of setup_render_passes. Before rendering, show the user a preview_render and get their OK: nothing goes to After Effects without it.",
+            inputSchema: z.object({
+                elements: z
+                    .record(z.string(), z.array(z.string()).min(1))
+                    .optional()
+                    .describe("{element name: [collection or object names]}, in stacking order front to back (first = on top in AE) if no camera depth is available. Required unless remove=true."),
+                others: z
+                    .enum(["holdout", "indirect_only", "exclude"])
+                    .default("holdout")
+                    .describe("What the OTHER elements do in each element's layer. holdout = cut out (correct overlaps); indirect_only = invisible to camera but still shadows/reflections (Cycles); exclude = removed."),
+                passes: z.array(z.string()).default(["combined", "ao", "shadow", "z", "crypto_object"]).describe("Same names as setup_render_passes."),
+                shadowCatchers: z.array(z.string()).optional().describe("Objects to mark as shadow catchers (objects already marked are found automatically)."),
+                outputDir: z.string().optional().describe("Blender path. Default //render/<scene>/."),
+                depth: z.enum(["16", "32"]).default("16"),
+                codec: z.enum(["ZIP", "PIZ", "DWAA", "DWAB", "ZIPS", "NONE"]).default("ZIP"),
+                filmTransparent: z.boolean().default(true),
+                shadows: z
+                    .enum(["shared", "per_element"])
+                    .default("shared")
+                    .describe("Shadow catcher pass. Held-out elements still cast shadows, so with holdout/indirect_only every element's catcher pass holds ALL the shadows: 'shared' = one shadow layer for all (import_render_to_ae switches on just one). 'per_element' = an extra shadow-only view layer per element (others excluded), so each element brings its own shadow pass; costs one more render per element. others='exclude' is always per element."),
+                disableUserLayers: z.boolean().default(true).describe("Switch off the scene's other view layers so only the elements render."),
+                remove: z.boolean().default(false).describe("Undo: delete the element layers and their nodes, switch the user's layers back on.")
+            })
+        },
+        async (args) =>
+            runTool(() =>
+                runPython(
+                    `
+sc = scene()
+if args["remove"]:
+    return remove_element_layers(sc)
+if not args.get("elements"):
+    raise ValueError("Give elements, e.g. {'Ball': ['Ball'], 'Confetti': ['Confetti']}")
+tag = safe_name(sc.name)
+out_dir = args.get("outputDir") or f"//render/{tag}/"
+if not out_dir.endswith("/"):
+    out_dir += "/"
+res = setup_element_layers(sc, args["elements"], args["others"], args["passes"], out_dir, args["depth"], args["codec"],
+                           args.get("shadowCatchers"), args["disableUserLayers"], args["shadows"])
+rd, im = sc.render, sc.render.image_settings
+rd.film_transparent = args["filmTransparent"]
+im.media_type = "MULTI_LAYER_IMAGE"
+im.file_format = "OPEN_EXR_MULTILAYER"
+im.color_depth = args["depth"]
+im.exr_codec = args["codec"]
+rd.filepath = out_dir + tag + "_"
+rd.use_file_extension = True
+res["multilayer_pattern"] = bpy.path.abspath(out_dir) + tag + "_####.exr"
+res["engine"] = rd.engine
+res["depth_from_camera"] = element_depths(sc)
+res["next"] = ("Show the user a preview_render of each element layer before rendering, and get an OK "
+               "before render_animation / import_render_to_ae.")
+return res
+`,
+                    args,
+                    { undo: "MCP: element layers" }
+                )
+            )
+    );
+
+    server.registerTool(
         "render_animation",
         {
             title: "Render animation (background)",
             description:
-                "Renders the frame range in a separate background Blender process from a saved snapshot of the current file, so the user's Blender stays usable. Returns a jobId immediately; poll with get_render_status. Progress also shows in Blender's sidebar (N) > MCP. This spends machine time (a Cycles shot can take hours): confirm frame range, engine and samples with the user before starting. The file must have been saved at least once (the snapshot is written next to it so // paths keep working).",
+                "Renders the frame range in a separate background Blender process from a saved snapshot of the current file, so the user's Blender stays usable. Returns a jobId immediately; poll with get_render_status. Progress also shows in Blender's sidebar (N) > MCP. This spends machine time (a Cycles shot can take hours): confirm frame range, engine and samples with the user before starting, and when the render is meant for After Effects show them a preview_render (one per element layer) and wait for their OK. With setup_element_layers, the job lists each element's folder (nearest to the camera first) so import_render_to_ae can bring them in as separate groups. The file must have been saved at least once (the snapshot is written next to it so // paths keep working).",
             inputSchema: z.object({
                 frameStart: z.number().int().optional(),
                 frameEnd: z.number().int().optional(),
@@ -256,6 +349,8 @@ return result
                     end: number;
                     output_dir: string;
                     passes_dir: string | null;
+                    elements: { name: string; dir: string; depth: number | null }[];
+                    element_shadows: string | null;
                     fps: number;
                     width: number;
                     height: number;
@@ -276,6 +371,8 @@ return {"copy": copy, "file": bpy.data.filepath, "scene": sc.name,
         "end": args.get("frameEnd") if args.get("frameEnd") is not None else sc.frame_end,
         "output_dir": os.path.dirname(bpy.path.abspath(sc.render.filepath)),
         "passes_dir": bpy.path.abspath(fo.directory) if fo and not fo.mute else None,
+        "elements": element_outputs(sc),
+        "element_shadows": sc.get(SHADOWS_PROP),
         "fps": fps(sc), "width": w, "height": h}
 `,
                     args
@@ -295,12 +392,20 @@ return {"copy": copy, "file": bpy.data.filepath, "scene": sc.name,
                     savedFiles: [],
                     outputDir: info.output_dir,
                     passesDir: info.passes_dir,
+                    elements: info.elements.length ? info.elements : null,
+                    elementShadows: info.elements.length ? ((info.element_shadows ?? "shared") as RenderJob["elementShadows"]) : null,
                     fps: info.fps,
                     width: info.width,
                     height: info.height,
                     startedAt: new Date().toISOString(),
                     logTail: []
                 };
+                if (job.elements) {
+                    // Lets import_render_to_ae find the elements from the folder alone (e.g. after a server restart).
+                    await mkdir(job.outputDir, { recursive: true });
+                    const meta = { scene: job.scene, fps: job.fps, shadows: job.elementShadows, elements: job.elements };
+                    await writeFile(join(job.outputDir, ELEMENTS_FILE), JSON.stringify(meta, null, 2));
+                }
                 const framesSeen = new Set<number>();
                 runJobProcess(
                     job,

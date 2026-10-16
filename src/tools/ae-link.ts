@@ -1,12 +1,12 @@
 import { z } from "zod";
-import { readdir } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/server";
 import { runPython } from "../blender-bridge.js";
 import { runExtendScript, runExtendScriptInUndoGroup } from "../ae/ae-bridge.js";
 import { jsxLiteral } from "../ae/jsx-literal.js";
 import { runTool } from "../tool-helpers.js";
-import { jobs } from "../jobs.js";
+import { ELEMENTS_FILE, jobs } from "../jobs.js";
 
 const PPM = z
     .number()
@@ -295,75 +295,135 @@ return {"objects": apply_from_ae(data, args["ppm"], args["collection"], args["se
         {
             title: "Import Blender render into After Effects",
             description:
-                "Imports rendered image sequences into After Effects and stacks them in a comp. Give a jobId from render_animation, or a directory. With separate passes, the beauty is the visible base layer and each pass is added above it, disabled, with a suggested blend mode (AO/shadow multiply, emission/glossy/env add) so the compositor switches on what they need. Multilayer EXR comes in as one layer (use AE's Cryptomatte effect or EXtractoR on it). If the comp already holds an opaque footage layer (the plate, e.g. the filmed shot), the beauty goes right above it and the shadow catcher pass (Cycles shadow_catcher) right below the beauty, switched on in Multiply, so the CG casts its shadows onto the plate; the other passes sit above the beauty. Without a plate, the layers go to the bottom of the comp, below any camera/nulls from export_to_ae. To land in the plate's comp, pass its name as compName. Footage is interpreted at the Blender fps.",
+                "Imports rendered image sequences into After Effects and stacks them in a comp. Only after the user has seen the render (or a preview_render) and said OK to bringing it into AE. Give a jobId from render_animation, or a directory. With separate passes, the beauty is the visible base layer and each pass is added above it, disabled, with a suggested blend mode (AO/shadow multiply, emission/glossy/env add) so the compositor switches on what they need. Per-element renders (setup_element_layers) come in as one group of adjacent layers per element, named '<element> <pass>' and colour-labelled per element: [passes off] > beauty for each element, nearest to the camera on top (or in the order given), then the shadow catcher passes, then the plate. Shared shadows (holdout) come in once, as 'Blender shadows (all elements)'. Multilayer EXR comes in as one layer, off when there are separate passes (use AE's Cryptomatte effect or EXtractoR on it). If the comp already holds an opaque footage layer (the plate, e.g. the filmed shot), the CG goes right above it and the shadow catcher passes (Cycles shadow_catcher) sit under the beauties, switched on in Multiply, so the CG casts its shadows onto the plate. Without a plate, the layers go to the bottom of the comp, below any camera/nulls from export_to_ae. To land in the plate's comp, pass its name as compName. Footage is interpreted at the Blender fps.",
             inputSchema: z.object({
                 jobId: z.string().optional(),
-                directory: z.string().optional().describe("Absolute directory with the sequences (used if no jobId)."),
+                directory: z
+                    .string()
+                    .optional()
+                    .describe("Absolute directory with the sequences (used if no jobId). For a per-element render give the scene's render folder (//render/<scene>/): its element subfolders are found from mcp_elements.json or by name."),
                 passesDirectory: z.string().optional(),
+                elements: z
+                    .array(z.object({ name: z.string(), directory: z.string() }))
+                    .optional()
+                    .describe("Explicit per-element folders, front (top of the comp) to back. Overrides the job's or directory's elements."),
+                elementOrder: z.array(z.string()).optional().describe("Element names front to back, to override the camera-depth order."),
+                sharedShadows: z
+                    .boolean()
+                    .optional()
+                    .describe("Whether every element's shadow catcher pass holds all the shadows (setup_element_layers shadows='shared'). Default: from the job or mcp_elements.json, else false."),
                 compName: z.string().optional().describe("Default: '<scene>' for a job, folder name otherwise."),
-                fps: z.number().positive().optional().describe("Default: the job's fps, else 25.")
+                fps: z.number().positive().optional().describe("Default: the job's fps, else 25."),
+                projectFolder: z.string().default("Blender Renders").describe("AE project folder for the footage; 'A/B' nests B in A. Elements get a subfolder each.")
             })
         },
         async (args) =>
             runTool(async () => {
-                let dirs: string[] = [];
+                // One source folder: element "" = the single-layer render.
+                let sources: { dir: string; element: string; kind: "auto" | "passes" }[] = [];
                 let fps = args.fps;
                 let compName = args.compName;
                 let size: number[] | null = null;
+                let elements: { name: string; dir: string }[] | null = null;
+                let shared: boolean | undefined = args.sharedShadows;
                 if (args.jobId) {
                     const job = jobs.get(args.jobId);
                     if (!job || job.kind !== "render") throw new Error(`No render job ${args.jobId}`);
                     if (job.status === "running") throw new Error(`Job ${job.id} is still rendering (${job.framesDone} frames done)`);
-                    dirs = [job.outputDir, ...(job.passesDir ? [job.passesDir] : [])];
+                    sources = [{ dir: job.outputDir, element: "", kind: "auto" }];
+                    if (job.passesDir) sources.push({ dir: job.passesDir, element: "", kind: "auto" });
+                    if (job.elements) elements = job.elements;
+                    shared ??= job.elementShadows === "shared";
                     fps ??= job.fps;
                     compName ??= job.scene;
                     size = [job.width, job.height];
                 } else if (args.directory) {
-                    dirs = [args.directory, ...(args.passesDirectory ? [args.passesDirectory] : [])];
+                    sources = [{ dir: args.directory, element: "", kind: "auto" }];
+                    if (args.passesDirectory) sources.push({ dir: args.passesDirectory, element: "", kind: "auto" });
                     compName ??= args.directory.replace(/\/+$/, "").split("/").pop();
-                } else {
-                    throw new Error("Give jobId or directory");
+                    const found = await findElementDirs(args.directory);
+                    if (found) {
+                        elements = found.elements;
+                        shared ??= found.shadows === "shared";
+                        fps ??= found.fps;
+                    }
+                } else if (!args.elements) {
+                    throw new Error("Give jobId, directory or elements");
                 }
+                if (args.elements) elements = args.elements.map((e) => ({ name: e.name, dir: e.directory }));
+                if (elements && args.elementOrder) {
+                    const rank = (n: string) => {
+                        const i = args.elementOrder!.indexOf(n);
+                        return i < 0 ? 1e9 : i;
+                    };
+                    elements = [...elements].sort((a, b) => rank(a.name) - rank(b.name));
+                }
+                for (const e of elements ?? []) sources.push({ dir: e.dir, element: e.name, kind: "passes" });
+                compName ??= elements?.[0]?.name ?? "Blender";
                 fps ??= 25;
 
-                const seqs = new Map<string, { first: string; firstNum: number; count: number; tag: string }>();
-                for (const dir of dirs) {
-                    for (const f of await readdir(dir)) {
+                const seqs = new Map<string, { first: string; firstNum: number; count: number; tag: string; element: string; kind: string }>();
+                for (const src of sources) {
+                    for (const f of await readdir(src.dir)) {
                         const m = /^(.*?)(\d+)\.(exr|png|tif|tiff|jpg|jpeg|dpx)$/i.exec(f);
                         if (!m || f.includes(".mcp_render")) continue;
-                        const key = join(dir, m[1] + "#." + m[3].toLowerCase());
+                        const key = join(src.dir, m[1] + "#." + m[3].toLowerCase());
                         const num = Number(m[2]);
                         const cur = seqs.get(key);
-                        if (!cur) seqs.set(key, { first: join(dir, f), firstNum: num, count: 1, tag: m[1] });
+                        if (!cur) seqs.set(key, { first: join(src.dir, f), firstNum: num, count: 1, tag: m[1], element: src.element, kind: src.kind });
                         else {
                             cur.count++;
-                            if (num < cur.firstNum) Object.assign(cur, { first: join(dir, f), firstNum: num });
+                            if (num < cur.firstNum) Object.assign(cur, { first: join(src.dir, f), firstNum: num });
                         }
                     }
                 }
-                if (seqs.size === 0) throw new Error(`No image sequences found in ${dirs.join(", ")}`);
-                const list = [...seqs.values()].map((s) => {
+                if (seqs.size === 0) throw new Error(`No image sequences found in ${sources.map((s) => s.dir).join(", ")}`);
+                let list = [...seqs.values()].map(({ kind, ...s }) => {
                     const tag = /_([A-Za-z]+)_$/.exec(s.tag)?.[1] ?? "beauty";
-                    return { ...s, pass: s.first.includes("/passes/") ? tag : "multilayer" };
+                    const isPass = kind === "passes" || s.first.includes("/passes/");
+                    return { ...s, pass: isPass ? tag : "multilayer" };
                 });
+                // Shared shadows are the same picture in every element: bring in one.
+                let sharedShadowFrom: string | null = null;
+                if (elements && shared) {
+                    const catchers = list.filter((s) => s.element && s.pass === "shadowCatcher");
+                    sharedShadowFrom = catchers[catchers.length - 1]?.element ?? null;
+                    list = list.filter((s) => !(s.element && s.pass === "shadowCatcher" && s.element !== sharedShadowFrom));
+                }
+                const groups = elements ? elements.map((e) => e.name).filter((n) => list.some((s) => s.element === n)) : [];
 
                 return runExtendScriptInUndoGroup(
                     `${JSX_GET_OR_CREATE_COMP}
 var seqs = ${jsxLiteral(list)};
+var groups = ${jsxLiteral(groups)};
+var sharedShadowFrom = ${jsxLiteral(sharedShadowFrom)};
 var fps = ${jsxLiteral(fps)};
 var size = ${jsxLiteral(size)};
 var compName = ${jsxLiteral(compName)};
+var folderPath = ${jsxLiteral(args.projectFolder.split("/").filter(Boolean))};
 var BLEND = { AO: "MULTIPLY", shadow: "MULTIPLY", emission: "ADD", glossDir: "ADD", glossInd: "ADD", env: "ADD", bloom: "ADD", volDir: "ADD", transDir: "ADD", transInd: "ADD" };
-var folder = null;
-for (var i = 1; i <= app.project.numItems; i++) {
-    if (app.project.item(i) instanceof FolderItem && app.project.item(i).name === "Blender Renders") folder = app.project.item(i);
+// AE label colours, one per element group: red, yellow, aqua, pink, lavender, peach, sea foam, blue, green, purple, orange...
+var LABELS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+function findFolder(name, parent) {
+    for (var i = 1; i <= app.project.numItems; i++) {
+        var it = app.project.item(i);
+        if (it instanceof FolderItem && it.name === name && it.parentFolder === parent) return it;
+    }
+    var f = app.project.items.addFolder(name);
+    f.parentFolder = parent;
+    return f;
 }
-if (!folder) folder = app.project.items.addFolder("Blender Renders");
+var folder = app.project.rootFolder;
+for (var i = 0; i < folderPath.length; i++) folder = findFolder(folderPath[i], folder);
+function inOurFolder(item) {
+    for (var p = item.parentFolder; p && p !== app.project.rootFolder; p = p.parentFolder) if (p === folder) return true;
+    return false;
+}
 var items = [];
 function findImported(path) {
-    for (var k = 1; k <= folder.numItems; k++) {
-        var f = folder.item(k);
-        if (f instanceof FootageItem && f.file && f.file.fsName === path) return f;
+    for (var k = 1; k <= app.project.numItems; k++) {
+        var f = app.project.item(k);
+        if (f instanceof FootageItem && f.file && f.file.fsName === path && inOurFolder(f)) return f;
     }
     return null;
 }
@@ -379,19 +439,22 @@ for (var i = 0; i < seqs.length; i++) {
     io.sequence = seqs[i].count > 1;
     io.forceAlphabetical = false;
     var item = app.project.importFile(io);
-    item.parentFolder = folder;
+    item.parentFolder = seqs[i].element ? findFolder(seqs[i].element, folder) : folder;
     if (io.sequence) item.mainSource.conformFrameRate = fps;
     items.push({ item: item, s: seqs[i] });
 }
-// beauty / multilayer first so it ends up lowest in the stack
-items.sort(function (a, b) {
-    function rank(x) { return x.s.pass === "beauty" ? 0 : (x.s.pass === "multilayer" ? 1 : 2); }
-    return rank(a) - rank(b);
-});
+var hasBeauty = {};
+for (var i = 0; i < items.length; i++) if (items[i].s.pass === "beauty") hasBeauty[items[i].s.element] = true;
+function isBase(x) { return x.s.pass === "beauty" || (x.s.pass === "multilayer" && !x.s.element && !hasBeauty[""] && groups.length === 0); }
 var ref = items[0].item;
+for (var i = 0; i < items.length; i++) if (isBase(items[i])) { ref = items[i].item; break; }
 var got = __getOrCreateComp(compName, size ? size[0] : ref.width, size ? size[1] : ref.height, fps, ref.duration);
 var comp = got.comp;
-function layerName(x) { return x.s.pass === "multilayer" ? "Blender EXR (multilayer)" : "Blender " + x.s.pass; }
+function layerName(x) {
+    if (x.s.pass === "multilayer") return "Blender EXR (multilayer)";
+    if (x.s.element && x.s.pass === "shadowCatcher" && sharedShadowFrom) return "Blender shadows (all elements)";
+    return x.s.element ? x.s.element + " " + x.s.pass : "Blender " + x.s.pass;
+}
 for (var i = 0; i < items.length; i++) __removeLayersNamed(comp, layerName(items[i]));
 // The plate: the topmost enabled, opaque file-footage layer that is not one of our renders.
 var plate = null;
@@ -400,45 +463,83 @@ for (var i = 1; i <= comp.numLayers && !plate; i++) {
     if (!(P instanceof AVLayer) || P.nullLayer || P.adjustmentLayer || P.guideLayer || !P.enabled) continue;
     var ps = P.source;
     if (!(ps instanceof FootageItem) || !(ps.mainSource instanceof FileSource) || ps.mainSource.hasAlpha) continue;
-    if (ps.parentFolder === folder || /^Blender /.test(P.name)) continue;
+    if (inOurFolder(ps) || /^Blender /.test(P.name)) continue;
     plate = P;
 }
-var hasBeauty = false;
-for (var i = 0; i < items.length; i++) if (items[i].s.pass === "beauty") hasBeauty = true;
-var base = null, catcher = null, others = [], added = [];
+// Per group (element, or "" for a single-layer render): passes above, then the base.
+var byGroup = {}, catchers = [], multilayer = [], added = [];
+var order = groups.length ? groups.slice() : [""];
+for (var g = 0; g < order.length; g++) byGroup[order[g]] = { passes: [], base: null };
 for (var i = 0; i < items.length; i++) {
     var x = items[i];
     var L = comp.layers.add(x.item);
     L.name = layerName(x);
     L.startTime = 0;
-    var isBase = x.s.pass === "beauty" || (x.s.pass === "multilayer" && !hasBeauty);
+    var base = isBase(x);
     var isCatcher = x.s.pass === "shadowCatcher";
     // The shadow catcher pass is the plate's shading (white = untouched): multiplied over the plate it adds the shadows.
-    var visible = isBase || (isCatcher && plate !== null);
+    var visible = base || (isCatcher && plate !== null);
     if (!visible) L.enabled = false;
     var blend = isCatcher ? "MULTIPLY" : BLEND[x.s.pass];
     if (blend) L.blendingMode = BlendingMode[blend];
+    var gi = -1;
+    for (var g = 0; g < groups.length; g++) if (groups[g] === x.s.element) gi = g;
+    if (gi >= 0) L.label = LABELS[gi % LABELS.length];
     var fit = null;
     if (x.item.width !== comp.width) {
         fit = comp.width / x.item.width * 100;
         L.transform.scale.setValue([fit, fit]);
     }
-    if (isBase && !base) base = L; else if (isCatcher) catcher = L; else others.push(L);
-    added.push({ layer: L.name, frames: x.s.count, visible: visible, blend: blend || "NORMAL", scaledToFitPercent: fit });
+    var grp = byGroup[x.s.element];
+    if (isCatcher) catchers.push({ L: L, g: gi });
+    else if (x.s.pass === "multilayer" && groups.length) multilayer.push(L);
+    else if (base && grp && !grp.base) grp.base = L;
+    else if (grp) grp.passes.push(L);
+    else multilayer.push(L);
+    added.push({ layer: L.name, element: x.s.element || null, frames: x.s.count, visible: visible, blend: blend || "NORMAL", scaledToFitPercent: fit });
 }
-// Stack: [other passes, off] > beauty > shadow catcher (multiply) > plate. Without a plate everything goes to the bottom.
-if (plate) base.moveBefore(plate); else base.moveToEnd();
-if (catcher) catcher.moveAfter(base);
-for (var i = 0; i < others.length; i++) others[i].moveBefore(base);
-var order = [];
-for (var i = 1; i <= comp.numLayers; i++) order.push(comp.layer(i).name);
+catchers.sort(function (a, b) { return a.g - b.g; });
+// Stack, top to bottom: [passes, off] > base for each group (nearest first) > multilayer (off) > shadow catchers (multiply) > plate.
+var stack = [];
+for (var g = 0; g < order.length; g++) {
+    var G = byGroup[order[g]];
+    for (var k = 0; k < G.passes.length; k++) stack.push(G.passes[k]);
+    if (G.base) stack.push(G.base);
+}
+for (var k = 0; k < multilayer.length; k++) stack.push(multilayer[k]);
+for (var k = 0; k < catchers.length; k++) stack.push(catchers[k].L);
+for (var k = 0; k < stack.length; k++) { if (plate) stack[k].moveBefore(plate); else stack[k].moveToEnd(); }
+var layerOrder = [];
+for (var i = 1; i <= comp.numLayers; i++) layerOrder.push(comp.layer(i).name);
 var notes = ["EXR is linear: set the project to a linear working space / OCIO, or interpret footage as Linear Rec.709, to match Blender."];
-if (catcher && !plate) notes.push("No opaque footage layer (plate) found: the shadow catcher pass was left off at the bottom. Put it under the beauty and over the plate, in Multiply.");
-return { comp: comp.name, created: got.created, plate: plate ? plate.name : null, layers: added, order: order, notes: notes };
+if (catchers.length && !plate) notes.push("No opaque footage layer (plate) found: the shadow catcher passes were left off, under the CG. Put them over the plate, in Multiply.");
+if (sharedShadowFrom) notes.push("Shadows are shared (holdout): every element's shadow catcher pass holds all the shadows, so it comes in once. For one shadow layer per element, re-run setup_element_layers with shadows='per_element'.");
+return { comp: comp.name, created: got.created, plate: plate ? plate.name : null, elements: groups, layers: added, order: layerOrder, notes: notes };
 `,
                     "blender-mcp: import_render_to_ae",
                     300_000
                 );
             })
     );
+}
+
+/**
+ * Per-element render folder: mcp_elements.json (written by render_animation) or, failing that,
+ * subfolders holding '<subfolder>_<pass>_####' sequences, in alphabetical order.
+ */
+async function findElementDirs(dir: string): Promise<{ elements: { name: string; dir: string }[]; shadows?: string; fps?: number } | null> {
+    try {
+        const meta = JSON.parse(await readFile(join(dir, ELEMENTS_FILE), "utf8"));
+        if (Array.isArray(meta.elements) && meta.elements.length) return meta;
+    } catch {
+        /* no metadata: look at the subfolders */
+    }
+    const found: { name: string; dir: string }[] = [];
+    for (const ent of await readdir(dir, { withFileTypes: true })) {
+        if (!ent.isDirectory()) continue;
+        const sub = join(dir, ent.name);
+        const files = await readdir(sub).catch(() => [] as string[]);
+        if (files.some((f) => f.startsWith(ent.name + "_") && /_[A-Za-z]+_\d+\.\w+$/.test(f))) found.push({ name: ent.name, dir: sub });
+    }
+    return found.length ? { elements: found.sort((a, b) => a.name.localeCompare(b.name)) } : null;
 }

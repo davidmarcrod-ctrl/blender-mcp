@@ -412,7 +412,7 @@ def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
     # Deferred: preferences aren't fully available during register at startup.
-    bpy.app.timers.register(_auto_start, first_interval=0.5)
+    bpy.app.timers.register(_auto_start, first_interval=0.5, persistent=True)  # persistent: survives the file load when Blender opens with a .blend
     if not bpy.app.background:
         bpy.app.timers.register(_poll_jobs, first_interval=1.0, persistent=True)
 
